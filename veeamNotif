@@ -1,0 +1,16 @@
+$webHook = " "
+
+$vbr = Get-VBRBackupSession | Where-Object {$_.OrigJobName -eq "Marz Personal"} | sort-object -property EndTime -Descending | Select-Object OrigJobName,Result,EndTime -First 1 |ft -HideTableHeaders | out-string
+
+$body = @{
+    'username' = 'Veeam'
+    'content' = "$vbr"}
+try {
+Invoke-RestMethod -Uri $webHook -Method 'Post' -Body ($body | ConvertTo-Json)  -ContentType "application/json"
+}
+catch {
+add-content -path "C:\Powershell\log.txt" -value "$Error"
+}
+
+shutdown /s
+
