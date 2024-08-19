@@ -1,0 +1,198 @@
+if (!(Get-Module -ListAvailable -Name Microsoft.Graph* )) {
+   install-Module Microsoft.Graph -Force -Verbose -Scope CurrentUser 
+} 
+
+if (!(Get-Module -ListAvailable -Name Microsoft.Graph.Beta*)) {
+    install-Module Microsoft.Graph.Beta.Users -Force -Verbose -Scope CurrentUser
+}
+
+if (!(Get-Module -ListAvailable -Name Microsoft.Graph.Beta*)) {
+    install-Module Microsoft.Graph.Beta.Users -Force -Verbose -Scope CurrentUser
+}
+if (!(Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+    Install-Module -Name ExchangeOnlineManagement  -Force -Verbose -Scope CurrentUser
+}
+
+Import-Module Microsoft.Graph.Beta.Users
+Import-Module ExchangeOnlineManagement
+Connect-MgGraph -Scopes User.ReadWrite.All -NoWelcome
+Connect-ExchangeOnline
+
+$userPrompt = Read-Host "Enter Name of Departing Employee (e.g John Doe) (If employee has middle name, please enter first and middle name together (e.g. JohnSmith Doe)"
+$user = Get-MgBetaUser -Filter "DisplayName eq '$userPrompt'"
+$date = Read-Host "Departure Date (e.g January 01, 2021)"
+$userDistinguishedName = $user.OnPremisesDistinguishedName
+$userSAM = $user.OnPremisesSamAccountName
+$userDisplayName = $user.DisplayName
+$userUPN = $user.UserPrincipalName
+$computer = Get-ADComputer -Filter {Description -Like $user.DisplayName}
+$computername = (Get-ADComputer -Filter {Description -Like $userDisplayName}).name
+$password = Invoke-RestMethod https://www.dinopass.com/password/strong
+$getdate = Get-Date
+
+
+#Sign out user
+Revoke-MgUserSignInSession -UserId $userUPN
+
+
+#Change the description and disable the computer account
+try{
+Set-ADComputer $computer -Description "$($userDisplayName) - Available for re-assignment" -Enabled $false
+echo "Available for re-assignment appended to $userDisplayName's computer description. $computername disabled." >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+catch{
+echo "$userDisplayName did not have a computer to disable" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+
+#Reset user's AD account password
+Set-ADAccountPassword  $userDistinguishedName -reset -NewPassword (ConvertTo-SecureString -AsPlainText $password -Force -Verbose) –PassThru
+echo "$userDisplayName's account password reset" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#Disable the AD account
+Disable-ADAccount -Identity $userDistinguishedName
+echo "$userDisplayName's account disabled" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#set msExchHideFromAddressLists AD attribute to TRUE
+Set-ADObject -Identity $userDistinguishedName -Replace @{msExchHideFromAddressLists=$TRUE}
+echo "User $userDisplayName's msExchHideFromAddressLists AD attribute set to true" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#remove user from security groups except domain users
+$usercomp = (Get-ADPrincipalGroupMembership $userDistinguishedName  | Where-Object {$_.name -ne "Domain Users"}).name
+Get-ADUser -Identity $userDistinguishedName -Properties MemberOf | ForEach-Object {
+  $_.MemberOf | Remove-ADGroupMember -Members $userDistinguishedName -Confirm:$false
+}
+echo "`n$userDisplayName removed from the following security groups, **$usercomp** (All except domain users)`n" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#Edit account description with departure date
+Get-ADUser $userDistinguishedName -Properties Description | ForEach-Object { Set-ADUser $_ -Description "$($_.Description) - Departed on $date" }
+echo "Date of departure, $date, appended to user $userDisplayName's description" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#Clear manager setting in AD
+$mgr = get-aduser $userDistinguishedName -Properties * | select -Property Manager
+Get-ADUser $userDistinguishedName | Set-ADUser -Manager $null
+echo "$userDisplayName's manager field, $mgr, cleared" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+
+#Move user to Disabled Users OU
+Get-ADUser -Filter "Name -eq '$userDisplayName'" | Set-ADObject -ProtectedFromAccidentalDeletion:$false -PassThru | Move-ADObject -TargetPath 'OU=Disabled Users,<redacted>'
+Get-ADUser -Filter "Name -eq '$userDisplayName'" -SearchBase "OU=Disabled Users,<redacted>" | Set-ADObject -ProtectedFromAccidentalDeletion:$true
+echo "$userDisplayName moved to Disabled Users OU`n" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+<#
+Exchange online portion of the script
+#>
+$groupMembership = Get-MgUserMemberOf -UserId $user.id
+    
+foreach ($groupID in $groupMembership.id) {   
+    try{
+    Remove-MgGroupMemberByRef -GroupId $groupID -DirectoryObjectId  $user.Id -ErrorAction Stop
+    $m365Group = Get-MgGroup -GroupId $groupID | select displayname -ExpandProperty displayname
+    echo "$userDisplayName has been removed from the Microsoft 365 group **$m365Group** on Exchange Admin Center" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+    }
+    catch{
+    if ((Get-Group $groupID | Select GroupType -ExpandProperty GroupType) -eq "Universal"){
+        Remove-DistributionGroupMember -Identity $groupID -Member $userUPN -Confirm:$false
+        $dlGroup = Get-MgGroup -GroupId $groupID | select displayname -ExpandProperty displayname 
+        echo "$userDisplayName has been removed from the Distribution List **$dlGroup** on Exchange Admin Center" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+        }
+
+    }
+
+}
+ 
+#Remove inbox rules
+$rulesName = Get-InboxRule -Mailbox $useremail | Select-Object -ExpandProperty Name
+
+if ($rulesName -ne $null){
+    $ruleList = $rulesName -join ', '
+    Get-InboxRule -Mailbox $useremail | Remove-InboxRule -Confirm:$False
+    echo "Inbox rule(s) **$ruleList** removed.">> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}   
+
+#Disable OWA
+try{
+Set-CASMailbox -Identity $userUPN -OWAEnabled $false
+echo "`nOWA disabled on $userDisplayName's mailbox" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+catch{
+    echo "WARNING: $userDisplayName did not have OWA enabled" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+#disable Exchange activesync
+try{
+Set-CASMailbox -Identity $userUPN -ActiveSyncEnabled $false
+echo "Exchange ActiveSync disabled on $userDisplayName's mailbox" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+catch{
+    echo "WARNING: $userDisplayName did not have Exchange ActiveSync enabled" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+#disable Imap and Pop3
+try{
+Set-CASMailbox -Identity $userUPN -PopEnabled $false -ImapEnabled $false
+echo "IMAP and POP3 disabled on $userDisplayName's mailbox" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+catch{
+    echo "WARNING: $userDisplayName did not have IMAP and POP3 enabled" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+
+
+#convert mailbox to shared mailbox
+$loopCount = 0
+while ((Get-Mailbox $userUPN | Where-Object RecipientTypeDetails -eq "UserMailbox") -and ($loopCount -ne 3)){
+
+    try{
+    Set-Mailbox $userUPN -Type Shared
+    Start-Sleep -Seconds 3
+    if (Get-Mailbox $userUPN | Where-Object RecipientTypeDetails -eq "SharedMailbox"){
+        echo "$userDisplayName's mailbox converted to a shared mailbox" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+        }  
+    }
+
+    catch{
+    if ($loopCount -eq 3){
+        echo "WARNING: Could not convert user $userDisplayName's mailbox to a shared mailbox" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+        }
+
+    }  
+    $loopCount+= 1
+}
+
+#remove their O365 license
+$userlicense = Get-MgUserLicenseDetail -userid $user.id 
+try{
+    Set-MgUserLicense -UserId $user.id -AddLicenses @() -RemoveLicenses @($userlicense.SkuId)
+    foreach ($license in $userlicense.SkuPartNumber){
+        echo "$userDisplayName's license, **$license**, removed." >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+        }
+}
+catch{
+    echo "WARNING: Could not remove user $userDisplayName's O365 license" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+}
+
+if($user.BusinessPhones -ne $null)
+    {
+        echo "This user has an IP phone, please remove their information on https://10.10.13.10:9100/login and check for autodesk licenses`n`nPlease create a new Employee Departure record in the opened directory"
+        Start-Process "\\<redacted>\Record of Employee Departure"
+        Start-Process notepad "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+    }
+    else
+    {
+        echo "If this user is in the Engineering department, please check for AutoDesk licenses assigned.`n`nPlease create a new Employee Departure record in the opened directory"
+        Start-Process "\\<redacted>\Record of Employee Departure"
+        Start-Process notepad "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+    }
+
+$getdate2 = Get-Date
+Echo "`nEnd of logs - $getdate2" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+$datediff = New-TimeSpan -Start $getdate -End $getdate2
+$datediff2 = $datediff.ToString("hh' hours 'mm' minutes 'ss' seconds'")
+
+Write-Output "Script runtime: $datediff2" >> "\\<redacted>\Record of Employee Departure\Departure Logs\$userDisplayName.txt"
+
+Disconnect-MgGraph
+Disconnect-ExchangeOnline -Confirm:$false
